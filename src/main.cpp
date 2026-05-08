@@ -158,8 +158,8 @@ static void onPumpStop() {
 }
 
 // ── Colour palette (RGB888) ───────────────────────────────────────────────────
-static const uint32_t C_BG        = 0x0D1B2A;
-static const uint32_t C_PANEL     = 0x1A2A3A;
+static const uint32_t C_BG        = 0x143520;
+static const uint32_t C_PANEL     = 0x0A2010;
 static const uint32_t C_TEXT      = 0xD0D8E0;
 static const uint32_t C_DIM       = 0x6B7280;
 static const uint32_t C_ACCENT    = 0x00B4D8;
@@ -204,6 +204,7 @@ static void drawArcGauge(int cx, int cy, int r, int pct, bool active,
     const int RO = r;
     const int RI = r - 28;
 
+    canvas.fillArc(cx, cy, RI - 3, RO + 3, 135, 45, 0x000000);
     canvas.fillArc(cx, cy, RI, RO, 135, 45, C_METAL);
 
     if (active && pct > 0) {
@@ -211,9 +212,11 @@ static void drawArcGauge(int cx, int cy, int r, int pct, bool active,
         uint32_t wc   = waterColor(pct);
         canvas.fillArc(cx, cy, RI, RO, 135, end_angle, wc);
         float ea_rad = end_angle * DEG_TO_RAD;
-        int mid_r    = (RI + RO) / 2;
-        canvas.fillCircle(cx + (int)(mid_r * cosf(ea_rad)),
-                          cy + (int)(mid_r * sinf(ea_rad)), 7, lighten(wc, 60));
+        canvas.drawLine(cx + (int)((RI - 4) * cosf(ea_rad)),
+                        cy + (int)((RI - 4) * sinf(ea_rad)),
+                        cx + (int)((RO + 4) * cosf(ea_rad)),
+                        cy + (int)((RO + 4) * sinf(ea_rad)),
+                        lighten(wc, 80));
     }
 
     for (int i = 0; i <= 4; i++) {
@@ -273,8 +276,9 @@ static void pollDrum() {
     }
     HTTPClient http;
     http.begin("http://" DRUM_IP "/status");
-    http.setTimeout(500);
+    http.setTimeout(1000);
     int code = http.GET();
+    Serial0.printf("poll -> HTTP %d\n", code);
     if (code == HTTP_CODE_OK) {
         StaticJsonDocument<128> doc;
         if (!deserializeJson(doc, http.getString())) {
@@ -283,9 +287,9 @@ static void pollDrum() {
             int  new_dist   = doc["dist_mm"]   | -1;
             bool new_auto   = doc["auto_mode"] | true;
             bool new_sensor = doc["sensor_ok"] | false;
-            if (new_level != g_level_pct || new_pump != g_pump_on ||
-                new_dist  != g_dist_mm   || new_auto != g_auto_mode ||
-                new_sensor != g_sensor_ok || !g_reachable) {
+            if (abs(new_level - g_level_pct) >= 2 || new_pump != g_pump_on ||
+                new_auto != g_auto_mode  || new_sensor != g_sensor_ok ||
+                !g_reachable) {
                 g_dirty = true;
             }
             g_level_pct = new_level;
@@ -565,10 +569,16 @@ static void drawMainScreen() {
     canvas.drawString(pump ? "PUMP ON" : "PUMP OFF", 172, 456);
 
     // Auto / manual mode (shifted left to make room for STATS button)
-    canvas.setFont(&fonts::Font4);
     canvas.setTextDatum(lgfx::middle_center);
-    canvas.setTextColor(g_auto_mode ? C_ACCENT : C_AMBER);
-    canvas.drawString(g_auto_mode ? "AUTO" : "MANUAL OVERRIDE", 310, 456);
+    if (g_auto_mode) {
+        canvas.setFont(&fonts::Font4);
+        canvas.setTextColor(C_ACCENT);
+        canvas.drawString("AUTO", 360, 456);
+    } else {
+        canvas.setFont(&fonts::Font2);
+        canvas.setTextColor(C_AMBER);
+        canvas.drawString("MANUAL OVERRIDE", 360, 456);
+    }
 
     // STATS button
     canvas.fillRoundRect(462, 440, 100, 32, 8, C_PANEL);
@@ -724,6 +734,7 @@ static void handleTouch() {
         }
         // Return to Auto
         if (x >= 175 && x <= 625 && y >= 345 && y <= 410) {
+            g_auto_mode   = true; // optimistic — poll will confirm
             g_pending_cmd = CMD_AUTO;
             g_screen      = SCREEN_MAIN;
             g_dirty       = true;
