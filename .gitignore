@@ -1,2 +1,15 @@
 ﻿.pio/
 include/secrets.h
+
+# VS Code editor settings
+.vscode/
+
+# PlatformIO boilerplate placeholders
+include/README
+include/ui.h
+include/ui_events.h
+include/ui_helpers.h
+lib/README
+lib/lv_conf.h
+lv_conf.h
+test/

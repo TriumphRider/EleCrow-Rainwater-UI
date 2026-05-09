@@ -26,8 +26,9 @@ static volatile bool  g_pump_on   = false;
 static volatile int   g_dist_mm   = -1;
 static volatile bool  g_auto_mode = true;
 static volatile bool  g_sensor_ok = false;
-static volatile bool  g_reachable = false;
-static volatile bool  g_dirty     = true;
+static volatile bool  g_reachable  = false;
+static volatile bool  g_dirty      = true;
+static volatile int   g_fail_streak = 0;
 
 // ── Command queue: UI (Core 1) → poll task (Core 0) ──────────────────────────
 enum PendingCmd : uint8_t {
@@ -41,6 +42,8 @@ static volatile PendingCmd g_pending_cmd = CMD_NONE;
 static unsigned long g_last_manual_draw   = 0;
 static unsigned long g_last_countdown_sec = 0xFFFFFFFF;
 static unsigned long g_last_stats_draw    = 0;
+static unsigned long g_last_flash_ms      = 0;
+static bool          g_override_flash     = false;
 
 // ── RTC (PCF8563, I2C 0x51) ───────────────────────────────────────────────────
 // Wire times out after lcd.init() because the RGB LCD DMA interrupt starves the
@@ -232,15 +235,23 @@ static void drawArcGauge(int cx, int cy, int r, int pct, bool active,
     canvas.setTextDatum(lgfx::middle_center);
     if (active) {
         char buf[8];
-        snprintf(buf, sizeof(buf), "%d%%", pct);
+        snprintf(buf, sizeof(buf), "%d", pct);
         canvas.setTextColor(waterColor(pct));
         canvas.setFont(&fonts::Font7);
         canvas.setTextSize(1);
+        int32_t nw = canvas.textWidth(buf);
         canvas.drawString(buf, cx, cy - 12);
-        canvas.setFont(&fonts::Font2);
-        canvas.setTextColor(C_DIM);
+        canvas.setFont(&fonts::Font4);
         canvas.setTextSize(1);
-        canvas.drawString("FULL", cx, cy + 28);
+        canvas.setTextDatum(lgfx::bottom_left);
+        canvas.drawString("%", cx + nw / 2 + 2, cy - 12);
+        if (sublabel && sublabel[0]) {
+            canvas.setFont(&fonts::Font2);
+            canvas.setTextSize(1);
+            canvas.setTextDatum(lgfx::middle_center);
+            canvas.setTextColor(C_DIM);
+            canvas.drawString(sublabel, cx, cy + 28);
+        }
     } else {
         canvas.setTextColor(C_DIM);
         canvas.setFont(&fonts::Font4);
@@ -258,25 +269,19 @@ static void drawArcGauge(int cx, int cy, int r, int pct, bool active,
     canvas.setFont(&fonts::Font4);
     canvas.setTextSize(1.2);
     canvas.drawString(label, cx, label_y);
-
-    if (sublabel && sublabel[0]) {
-        canvas.setFont(&fonts::Font2);
-        canvas.setTextSize(1);
-        canvas.setTextColor(C_DIM);
-        canvas.drawString(sublabel, cx, label_y + 22);
-    }
 }
 
 // ── REST client (called only from Core-0 poll task) ───────────────────────────
 static void pollDrum() {
     if (WiFi.status() != WL_CONNECTED) {
         if (g_reachable) g_dirty = true;
-        g_reachable = false;
+        g_reachable   = false;
+        g_fail_streak = 0;
         return;
     }
     HTTPClient http;
     http.begin("http://" DRUM_IP "/status");
-    http.setTimeout(1000);
+    http.setTimeout(5000);
     int code = http.GET();
     Serial0.printf("poll -> HTTP %d\n", code);
     if (code == HTTP_CODE_OK) {
@@ -292,16 +297,20 @@ static void pollDrum() {
                 !g_reachable) {
                 g_dirty = true;
             }
-            g_level_pct = new_level;
-            g_pump_on   = new_pump;
-            g_dist_mm   = new_dist;
-            g_auto_mode = new_auto;
-            g_sensor_ok = new_sensor;
-            g_reachable = true;
+            g_level_pct   = new_level;
+            g_pump_on     = new_pump;
+            g_dist_mm     = new_dist;
+            g_auto_mode   = new_auto;
+            g_sensor_ok   = new_sensor;
+            g_reachable   = true;
+            g_fail_streak = 0;
         }
     } else {
-        if (g_reachable) g_dirty = true;
-        g_reachable = false;
+        g_fail_streak++;
+        if (g_fail_streak >= 3 && g_reachable) {
+            g_reachable = false;
+            g_dirty = true;
+        }
     }
     http.end();
 }
@@ -311,7 +320,7 @@ static void sendCmd(const char* path) {
     HTTPClient http;
     String url = String("http://" DRUM_IP) + path;
     http.begin(url);
-    http.setTimeout(500);
+    http.setTimeout(3000);
     int code = http.GET();
     Serial0.printf("CMD %s -> HTTP %d\n", path, code);
     http.end();
@@ -332,7 +341,7 @@ static void pollTask(void*) {
         g_pending_cmd  = CMD_NONE;
         if (cmd != CMD_NONE) {
             sendCmd(paths[cmd]);
-            vTaskDelay(pdMS_TO_TICKS(300));
+            vTaskDelay(pdMS_TO_TICKS(6000)); // let drum board settle after a command
         }
         pollDrum();
     }
@@ -534,6 +543,25 @@ static void drawStatsScreen() {
     canvas.drawString("Statistics saved across reboots  |  Pump events tracked automatically", 400, 456);
 }
 
+// ── Mode badge (partial repaint — auto label or flashing override alert) ──────
+static void updateModeBadge() {
+    canvas.fillRect(215, 440, 290, 32, C_PANEL);
+    canvas.setTextDatum(lgfx::middle_center);
+    canvas.setFont(&fonts::Font4);
+    canvas.setTextSize(1);
+    if (g_auto_mode) {
+        canvas.setTextColor(C_ACCENT);
+        canvas.drawString("AUTO MODE", 360, 456);
+    } else if (g_override_flash) {
+        canvas.fillRoundRect(222, 441, 276, 30, 6, C_AMBER);
+        canvas.setTextColor(C_BG);
+        canvas.drawString("MANUAL OVERRIDE", 360, 456);
+    } else {
+        canvas.setTextColor(C_AMBER);
+        canvas.drawString("MANUAL OVERRIDE", 360, 456);
+    }
+}
+
 // ── Main screen ───────────────────────────────────────────────────────────────
 static void drawMainScreen() {
     canvas.fillScreen(C_BG);
@@ -553,46 +581,35 @@ static void drawMainScreen() {
 
     canvas.fillRect(0, 432, 800, 48, C_PANEL);
 
-    // Drum online/offline
-    canvas.fillCircle(18, 456, 8, g_reachable ? C_GREEN : C_RED);
-    canvas.setTextDatum(lgfx::middle_left);
-    canvas.setFont(&fonts::Font2);
+    // Pump status — segmented pill (drum offline shown by gauge, not here)
+    bool pump     = g_reachable && g_pump_on;
+    bool pump_off = g_reachable && !g_pump_on;
+    canvas.setFont(&fonts::Font4);
     canvas.setTextSize(1);
-    canvas.setTextColor(g_reachable ? C_GREEN : C_RED);
-    canvas.drawString(g_reachable ? "DRUM ONLINE" : "DRUM OFFLINE", 32, 456);
-
-    // Pump status
-    bool pump = g_reachable && g_pump_on;
-    canvas.fillCircle(158, 456, 8, pump ? C_GREEN : C_DIM);
-    if (pump) canvas.fillCircle(158, 456, 4, 0xFFFFFF);
-    canvas.setTextColor(pump ? C_GREEN : C_DIM);
-    canvas.drawString(pump ? "PUMP ON" : "PUMP OFF", 172, 456);
-
-    // Auto / manual mode (shifted left to make room for STATS button)
+    canvas.setTextDatum(lgfx::middle_left);
+    canvas.setTextColor(C_GREEN);
+    canvas.drawString("PUMP:", 18, 456);
+    canvas.fillRoundRect(102, 440, 44, 32, 6, pump     ? C_GREEN : C_PANEL);
+    canvas.fillRoundRect(150, 440, 52, 32, 6, pump_off ? C_RED   : C_PANEL);
     canvas.setTextDatum(lgfx::middle_center);
-    if (g_auto_mode) {
-        canvas.setFont(&fonts::Font4);
-        canvas.setTextColor(C_ACCENT);
-        canvas.drawString("AUTO", 360, 456);
-    } else {
-        canvas.setFont(&fonts::Font2);
-        canvas.setTextColor(C_AMBER);
-        canvas.drawString("MANUAL OVERRIDE", 360, 456);
-    }
+    canvas.setTextColor(pump     ? C_BG : C_DIM); canvas.drawString("On",  124, 456);
+    canvas.setTextColor(pump_off ? C_BG : C_DIM); canvas.drawString("Off", 176, 456);
 
-    // STATS button
-    canvas.fillRoundRect(462, 440, 100, 32, 8, C_PANEL);
-    canvas.drawRoundRect(462, 440, 100, 32, 8, C_ACCENT);
+    updateModeBadge();
+
+    // STATS > button (right-aligned)
+    canvas.fillRoundRect(545, 440, 115, 32, 8, C_PANEL);
+    canvas.drawRoundRect(545, 440, 115, 32, 8, C_ACCENT);
     canvas.setFont(&fonts::Font4);
     canvas.setTextDatum(lgfx::middle_center);
     canvas.setTextColor(C_ACCENT);
-    canvas.drawString("STATS", 512, 456);
+    canvas.drawString("STATS >", 602, 456);
 
-    // MANUAL button (amber)
-    canvas.fillRoundRect(572, 440, 212, 32, 8, C_AMBER);
-    canvas.setTextDatum(lgfx::middle_center);
-    canvas.setTextColor(C_BG);
-    canvas.drawString("MANUAL  >", 678, 456);
+    // MANUAL > button (right-aligned, outlined amber)
+    canvas.fillRoundRect(664, 440, 128, 32, 8, C_PANEL);
+    canvas.drawRoundRect(664, 440, 128, 32, 8, C_AMBER);
+    canvas.setTextColor(C_AMBER);
+    canvas.drawString("MANUAL >", 728, 456);
 }
 
 // ── Pump buttons partial repaint ──────────────────────────────────────────────
@@ -690,13 +707,13 @@ static void handleTouch() {
 
     if (g_screen == SCREEN_MAIN) {
         // STATS button
-        if (x >= 462 && x <= 562 && y >= 440 && y <= 472) {
+        if (x >= 545 && x <= 660 && y >= 440 && y <= 472) {
             g_screen = SCREEN_STATS;
             g_dirty  = true;
             return;
         }
         // MANUAL button
-        if (x >= 572 && x <= 784 && y >= 440 && y <= 472) {
+        if (x >= 664 && x <= 792 && y >= 440 && y <= 472) {
             g_screen       = SCREEN_MANUAL;
             g_manual_entry = millis();
             g_dirty        = true;
@@ -898,8 +915,14 @@ void loop() {
 
     if (g_screen == SCREEN_MAIN) {
         if (g_dirty) {
+            g_override_flash = false;
+            g_last_flash_ms  = millis();
             drawMainScreen();
             g_dirty = false;
+        } else if (!g_auto_mode && millis() - g_last_flash_ms >= 600) {
+            g_override_flash = !g_override_flash;
+            g_last_flash_ms  = millis();
+            updateModeBadge();
         }
 
     } else if (g_screen == SCREEN_STATS) {
