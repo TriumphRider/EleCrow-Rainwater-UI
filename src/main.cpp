@@ -1,3 +1,4 @@
+// Vibecoded with Claude Code — https://claude.ai/code
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
@@ -6,6 +7,8 @@
 #include <LovyanGFX.hpp>
 #include <Preferences.h>
 #include <time.h>
+#include "esp_sleep.h"
+#include "driver/gpio.h"
 #include "LGFX_CrowPanel_5inch.h"
 #include "secrets.h"
 
@@ -17,7 +20,9 @@ static LGFX_CrowPanel lcd;
 enum Screen { SCREEN_MAIN, SCREEN_MANUAL, SCREEN_STATS };
 static Screen        g_screen       = SCREEN_MAIN;
 static unsigned long g_manual_entry = 0;
-static const unsigned long MANUAL_TIMEOUT = 30000;
+static unsigned long g_stats_entry  = 0;
+static const unsigned long MANUAL_TIMEOUT  = 30000;
+static const unsigned long STATS_TIMEOUT   = 30000;
 
 // ── Drum data ─────────────────────────────────────────────────────────────────
 // volatile: written by Core-0 poll task, read by Core-1 UI loop.
@@ -30,6 +35,26 @@ static volatile bool  g_reachable  = false;
 static volatile bool  g_dirty      = true;
 static volatile int   g_fail_streak = 0;
 
+static volatile int   g_tote_pct      = 0;
+static volatile int   g_tote_dist_mm  = -1;
+static volatile bool  g_tote_valid    = false;
+static volatile bool  g_tote_reachable = false;
+
+// ── Sleep / wake ──────────────────────────────────────────────────────────────
+#define SLEEP_TIMEOUT_MS (5UL * 60UL * 1000UL)   // 5 min idle → deep sleep
+static unsigned long g_last_touch_ms = 0;
+
+// ── Battery ADC ───────────────────────────────────────────────────────────────
+// IO8 header pin (right col row 6) = GPIO8 = ADC1_CH7.
+// ADC1: calibrated, no WiFi interference, no warm-up needed.
+// 2×100kΩ divider; R2 slightly > R1 → ratio 0.518 instead of 0.500.
+// Measured: 2056mV @ 3.97V battery → BATT_MV_* derived from that ratio.
+#define BATT_ADC_PIN  8
+#define BATT_MV_MIN   1550   // mV at pin for 3.0 V battery (empty) — tune if needed
+#define BATT_MV_MAX   2175   // mV at pin for 4.2 V battery (full)  — tune if needed
+static int            g_batt_pct     = -1;
+static unsigned long  g_last_batt_ms = 0;
+
 // ── Command queue: UI (Core 1) → poll task (Core 0) ──────────────────────────
 enum PendingCmd : uint8_t {
     CMD_NONE = 0,
@@ -39,10 +64,11 @@ enum PendingCmd : uint8_t {
 static volatile PendingCmd g_pending_cmd = CMD_NONE;
 
 // ── Redraw tracking ───────────────────────────────────────────────────────────
-static unsigned long g_last_manual_draw   = 0;
-static unsigned long g_last_countdown_sec = 0xFFFFFFFF;
-static unsigned long g_last_stats_draw    = 0;
-static unsigned long g_last_flash_ms      = 0;
+static unsigned long g_last_manual_draw          = 0;
+static unsigned long g_last_countdown_sec        = 0xFFFFFFFF;
+static unsigned long g_last_stats_draw           = 0;
+static unsigned long g_last_stats_countdown_sec  = 0xFFFFFFFF;
+static unsigned long g_last_flash_ms             = 0;
 static bool          g_override_flash     = false;
 
 // ── RTC (PCF8563, I2C 0x51) ───────────────────────────────────────────────────
@@ -315,6 +341,33 @@ static void pollDrum() {
     http.end();
 }
 
+static void pollTote() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    HTTPClient http;
+    http.begin("http://" TOTE_IP "/api/level");
+    http.setTimeout(5000);
+    int code = http.GET();
+    Serial0.printf("tote poll -> HTTP %d\n", code);
+    if (code == HTTP_CODE_OK) {
+        StaticJsonDocument<128> doc;
+        if (!deserializeJson(doc, http.getString())) {
+            int  new_pct   = doc["fill_pct"]    | 0;
+            int  new_dist  = doc["distance_mm"] | -1;
+            bool new_valid = doc["valid"]        | false;
+            if (new_pct != g_tote_pct || new_valid != g_tote_valid || !g_tote_reachable)
+                g_dirty = true;
+            g_tote_pct       = new_pct;
+            g_tote_dist_mm   = new_dist;
+            g_tote_valid     = new_valid;
+            g_tote_reachable = true;
+        }
+    } else {
+        if (g_tote_reachable) g_dirty = true;
+        g_tote_reachable = false;
+    }
+    http.end();
+}
+
 static void sendCmd(const char* path) {
     if (WiFi.status() != WL_CONNECTED) return;
     HTTPClient http;
@@ -326,6 +379,80 @@ static void sendCmd(const char* path) {
     http.end();
 }
 
+// ── Light sleep / wake ────────────────────────────────────────────────────────
+// Read GT911 status register 0x814E directly and clear it.
+// LGFX's getTouch() has internal timing guards that may skip the I2C read,
+// leaving INT asserted.  Going direct guarantees the register is cleared so
+// the GT911 releases INT after every spurious scan pulse.
+// Returns the touch-point count reported in the status byte.
+static int gt911ReadAndClear() {
+    const uint8_t reg[] = { 0x81, 0x4E };
+    uint8_t status = 0;
+    lgfx::i2c::transactionWriteRead(0, 0x5D, reg, 2, &status, 1, 400000u);
+    const uint8_t clr[] = { 0x81, 0x4E, 0x00 };
+    lgfx::i2c::transactionWrite(0, 0x5D, clr, 3, 400000u);
+    return (status & 0x80) ? (status & 0x0F) : 0;  // count only valid when buf-ready
+}
+
+struct GT911Touch { int count; uint16_t size; };
+
+// Read 0x814E (status) + 0x814F (key) + 8 bytes of touch-point 1 in one burst,
+// then clear 0x814E.  Touch-point 1 layout: track_id, xL, xH, yL, yH, szL, szH, rsvd.
+// buf offsets:  [0]=0x814E  [1]=0x814F  [2..8]=touch-pt1 bytes 0..6
+// size = buf[7] | (buf[8] << 8)
+static GT911Touch gt911ReadTouch() {
+    const uint8_t reg[] = { 0x81, 0x4E };
+    uint8_t buf[9] = {};
+    lgfx::i2c::transactionWriteRead(0, 0x5D, reg, 2, buf, 9, 400000u);
+    const uint8_t clr[] = { 0x81, 0x4E, 0x00 };
+    lgfx::i2c::transactionWrite(0, 0x5D, clr, 3, 400000u);
+    GT911Touch t;
+    t.count = (buf[0] & 0x80) ? (buf[0] & 0x0F) : 0;
+    t.size  = (t.count > 0) ? ((uint16_t)buf[7] | ((uint16_t)buf[8] << 8)) : 0;
+    return t;
+}
+
+static void enterDeepSleep() {
+    const uint8_t bl_off = 0x00;
+    lgfx::i2c::transactionWrite(0, 0x30, &bl_off, 1, 400000u);
+    // Drain any pending GT911 data while waiting for touch release
+    unsigned long t0 = millis();
+    while (digitalRead(1) == LOW && millis() - t0 < 3000) {
+        gt911ReadAndClear();
+        delay(20);
+    }
+    // Let capacitive charge on the display layer dissipate before we start
+    // watching for touches.  Keep clearing GT911 status so INT stays released.
+    unsigned long dead_end = millis() + 8000UL;
+    while (millis() < dead_end) {
+        gt911ReadAndClear();
+        delay(50);
+    }
+    // Poll for a sustained real touch — two consecutive reads 200 ms apart
+    // both reporting count > 0.  The 8 s dead window above already cleared
+    // the capacitive phantom window, so count alone is sufficient here.
+    for (;;) {
+        delay(200);
+        GT911Touch t = gt911ReadTouch();
+        if (t.count == 0) continue;
+        delay(200);
+        t = gt911ReadTouch();
+        if (t.count == 0) continue;
+        break;
+    }
+    canvas.fillScreen(C_BG);
+    const uint8_t bl_init = 0x10;
+    lgfx::i2c::transactionWrite(0, 0x30, &bl_init, 1, 400000u);
+    delay(50);
+    const uint8_t bl_on = 0x09;
+    lgfx::i2c::transactionWrite(0, 0x30, &bl_on, 1, 400000u);
+    g_screen        = SCREEN_MAIN;
+    g_dirty         = true;
+    g_last_touch_ms = millis();
+}
+
+static void readBattery();  // defined after drawBatteryIndicator
+
 // ── Core-0 poll task ──────────────────────────────────────────────────────────
 static void pollTask(void*) {
     static const char* paths[] = {
@@ -333,6 +460,7 @@ static void pollTask(void*) {
         "/pump/on", "/pump/off", "/auto",
         "/timeout?m=5", "/timeout?m=10", "/timeout?m=20", "/timeout?m=30"
     };
+    uint32_t tote_skips = 0;
     for (;;) {
         for (int i = 0; i < 30 && g_pending_cmd == CMD_NONE; i++)
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -344,6 +472,11 @@ static void pollTask(void*) {
             vTaskDelay(pdMS_TO_TICKS(6000)); // let drum board settle after a command
         }
         pollDrum();
+        if (++tote_skips >= 20) {   // ~60 s between tote polls
+            tote_skips = 0;
+            pollTote();
+            readBattery();  // Core-0 owns WiFi, safe to stop/start radio here
+        }
     }
 }
 
@@ -536,11 +669,7 @@ static void drawStatsScreen() {
 
     // ── Bottom bar ────────────────────────────────────────────────────────────
     canvas.fillRect(0, 432, 800, 48, C_PANEL);
-    canvas.setTextDatum(lgfx::middle_center);
-    canvas.setFont(&fonts::Font2);
-    canvas.setTextSize(1);
-    canvas.setTextColor(C_DIM);
-    canvas.drawString("Statistics saved across reboots  |  Pump events tracked automatically", 400, 456);
+    // countdown drawn dynamically by updateStatsCountdown()
 }
 
 // ── Mode badge (partial repaint — auto label or flashing override alert) ──────
@@ -562,6 +691,49 @@ static void updateModeBadge() {
     }
 }
 
+// ── Battery ───────────────────────────────────────────────────────────────────
+static void readBattery() {
+    // GPIO8 = ADC1_CH7: calibrated, no WiFi interference.
+    analogSetPinAttenuation(BATT_ADC_PIN, ADC_11db);
+    long sum = 0;
+    for (int i = 0; i < 8; i++) { sum += (long)analogReadMilliVolts(BATT_ADC_PIN); delay(2); }
+    int mv = (int)(sum / 8);
+
+    int pct = (int)(100L * (mv - BATT_MV_MIN) / (BATT_MV_MAX - BATT_MV_MIN));
+    pct = max(0, min(100, pct));
+    Serial0.printf("BATT mv=%d  pct=%d\n", mv, pct);
+    if (pct != g_batt_pct) { g_batt_pct = pct; g_dirty = true; }
+    g_last_batt_ms = millis();
+}
+
+static void drawBatteryIndicator() {
+    int pct  = g_batt_pct;
+    int segs = (pct < 0) ? 0
+             : (pct >= 95) ? 5 : (pct >= 75) ? 4 : (pct >= 50) ? 3
+             : (pct >= 25) ? 2 : 1;
+    uint32_t col = (pct < 0) ? C_DIM
+                 : (segs >= 3) ? C_GREEN : (segs == 2) ? C_AMBER : C_RED;
+
+    // Battery body outline + terminal nub
+    canvas.drawRoundRect(710, 12, 62, 26, 3, C_DIM);
+    canvas.fillRect(772, 19, 5, 12, C_DIM);
+
+    // 5 segments (10 px wide, 2 px gap, 22 px tall)
+    for (int i = 0; i < 5; i++)
+        canvas.fillRect(712 + i * 12, 14, 10, 22, (i < segs) ? col : C_PANEL);
+
+
+    // Percentage text
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextSize(1);
+    canvas.setTextDatum(lgfx::middle_right);
+    canvas.setTextColor(col);
+    char buf[8];
+    if (pct < 0) snprintf(buf, sizeof(buf), "--%%");
+    else         snprintf(buf, sizeof(buf), "%d%%", pct);
+    canvas.drawString(buf, 704, 25);
+}
+
 // ── Main screen ───────────────────────────────────────────────────────────────
 static void drawMainScreen() {
     canvas.fillScreen(C_BG);
@@ -573,11 +745,24 @@ static void drawMainScreen() {
     canvas.setTextSize(1);
     canvas.drawString("RAINWATER SYSTEM", 400, 27);
 
+    // Sleep button — top-left of header
+    canvas.fillRoundRect(8, 10, 80, 30, 6, C_PANEL);
+    canvas.drawRoundRect(8, 10, 80, 30, 6, C_DIM);
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextDatum(lgfx::middle_center);
+    canvas.setTextColor(C_DIM);
+    canvas.drawString("SLEEP", 48, 25);
+
+    drawBatteryIndicator();
+
     char dist_sub[20] = "";
     if (g_reachable && g_dist_mm > 0)
         snprintf(dist_sub, sizeof(dist_sub), "%d mm", g_dist_mm);
     drawArcGauge(200, 241, 150, g_level_pct, g_reachable && g_sensor_ok, "DRUM", dist_sub);
-    drawArcGauge(600, 241, 150, 0, false, "TOTE", nullptr);
+    char tote_sub[20] = "";
+    if (g_tote_reachable && g_tote_dist_mm > 0)
+        snprintf(tote_sub, sizeof(tote_sub), "%d mm", g_tote_dist_mm);
+    drawArcGauge(600, 241, 150, g_tote_pct, g_tote_reachable && g_tote_valid, "TOTE", tote_sub);
 
     canvas.fillRect(0, 432, 800, 48, C_PANEL);
 
@@ -644,6 +829,22 @@ static void updateCountdown() {
     canvas.drawString(tbuf, 400, 478);
 }
 
+// ── Stats countdown partial repaint ──────────────────────────────────────────
+static void updateStatsCountdown() {
+    unsigned long elapsed = millis() - g_stats_entry;
+    int secs = (int)((STATS_TIMEOUT - min(elapsed, STATS_TIMEOUT)) / 1000);
+    if ((unsigned long)secs == g_last_stats_countdown_sec) return;
+    g_last_stats_countdown_sec = secs;
+    char buf[48];
+    snprintf(buf, sizeof(buf), "Auto-returning in %d seconds", secs);
+    canvas.fillRect(0, 444, 800, 32, C_PANEL);
+    canvas.setTextDatum(lgfx::middle_center);
+    canvas.setTextColor(C_DIM);
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextSize(1);
+    canvas.drawString(buf, 400, 460);
+}
+
 // ── Manual screen ─────────────────────────────────────────────────────────────
 static void drawManualScreen() {
     canvas.fillScreen(C_BG);
@@ -699,6 +900,7 @@ static bool g_was_touched = false;
 static void handleTouch() {
     lgfx::touch_point_t tp;
     bool touched = lcd.getTouch(&tp, 1) > 0;
+    if (touched) g_last_touch_ms = millis();
     if (!touched) { g_was_touched = false; return; }
     if (g_was_touched) return;
     g_was_touched = true;
@@ -706,10 +908,16 @@ static void handleTouch() {
     int x = tp.x, y = tp.y;
 
     if (g_screen == SCREEN_MAIN) {
+        // SLEEP button (header, top-left)
+        if (x >= 8 && x <= 88 && y >= 10 && y <= 40) {
+            enterDeepSleep();
+            return;
+        }
         // STATS button
         if (x >= 545 && x <= 660 && y >= 440 && y <= 472) {
-            g_screen = SCREEN_STATS;
-            g_dirty  = true;
+            g_screen      = SCREEN_STATS;
+            g_stats_entry = millis();
+            g_dirty       = true;
             return;
         }
         // MANUAL button
@@ -720,6 +928,7 @@ static void handleTouch() {
         }
 
     } else if (g_screen == SCREEN_STATS) {
+        g_stats_entry = millis();  // any touch resets the auto-return timer
         // Back button
         if (x >= 626 && y >= 8 && y <= 42) {
             g_screen = SCREEN_MAIN;
@@ -809,6 +1018,8 @@ void setup() {
     // Load persisted stats from NVS
     loadStats();
 
+    readBattery();
+
     // Splash
     canvas.fillScreen(C_BG);
     canvas.setTextDatum(lgfx::middle_center);
@@ -876,9 +1087,11 @@ void setup() {
         tzset();
     }
 
+
     pollDrum();
     g_prev_pump_on   = g_pump_on;
     g_prev_level_pct = g_level_pct;
+    g_last_touch_ms  = millis();  // don't auto-sleep immediately after boot
 
     xTaskCreatePinnedToCore(pollTask, "poll", 4096, NULL, 1, NULL, 0);
 }
@@ -890,6 +1103,7 @@ void loop() {
         last_reconnect = millis();
         WiFi.reconnect();
     }
+
 
     // Pump state change detection (Core 1 — no cross-core race)
     bool cur_pump = g_pump_on;
@@ -911,6 +1125,10 @@ void loop() {
         g_dirty  = true;
     }
 
+    // Auto-sleep after idle on main screen
+    if (g_screen == SCREEN_MAIN && millis() - g_last_touch_ms > SLEEP_TIMEOUT_MS)
+        enterDeepSleep();
+
     handleTouch();
 
     if (g_screen == SCREEN_MAIN) {
@@ -926,12 +1144,18 @@ void loop() {
         }
 
     } else if (g_screen == SCREEN_STATS) {
-        if (g_dirty) {
+        if (millis() - g_stats_entry >= STATS_TIMEOUT) {
+            g_screen = SCREEN_MAIN;
+            g_dirty  = true;
+        } else if (g_dirty) {
+            g_last_stats_countdown_sec = 0xFFFFFFFF;
             drawStatsScreen();
+            updateStatsCountdown();
             g_last_stats_draw = millis();
             g_dirty = false;
         } else if (millis() - g_last_stats_draw >= 1000) {
-            updateStatsClock(); // partial repaint — only the clock panel
+            updateStatsClock();
+            updateStatsCountdown();
             g_last_stats_draw = millis();
         }
 
