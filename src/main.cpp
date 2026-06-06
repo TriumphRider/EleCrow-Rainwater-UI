@@ -379,76 +379,34 @@ static void sendCmd(const char* path) {
     http.end();
 }
 
-// ── Light sleep / wake ────────────────────────────────────────────────────────
-// Read GT911 status register 0x814E directly and clear it.
-// LGFX's getTouch() has internal timing guards that may skip the I2C read,
-// leaving INT asserted.  Going direct guarantees the register is cleared so
-// the GT911 releases INT after every spurious scan pulse.
-// Returns the touch-point count reported in the status byte.
-static int gt911ReadAndClear() {
+// ── Deep sleep / wake ─────────────────────────────────────────────────────────
+// Clears any pending GT911 touch data so the INT pin returns high before sleep.
+static void gt911DrainInt() {
     const uint8_t reg[] = { 0x81, 0x4E };
-    uint8_t status = 0;
-    lgfx::i2c::transactionWriteRead(0, 0x5D, reg, 2, &status, 1, 400000u);
     const uint8_t clr[] = { 0x81, 0x4E, 0x00 };
-    lgfx::i2c::transactionWrite(0, 0x5D, clr, 3, 400000u);
-    return (status & 0x80) ? (status & 0x0F) : 0;  // count only valid when buf-ready
-}
-
-struct GT911Touch { int count; uint16_t size; };
-
-// Read 0x814E (status) + 0x814F (key) + 8 bytes of touch-point 1 in one burst,
-// then clear 0x814E.  Touch-point 1 layout: track_id, xL, xH, yL, yH, szL, szH, rsvd.
-// buf offsets:  [0]=0x814E  [1]=0x814F  [2..8]=touch-pt1 bytes 0..6
-// size = buf[7] | (buf[8] << 8)
-static GT911Touch gt911ReadTouch() {
-    const uint8_t reg[] = { 0x81, 0x4E };
-    uint8_t buf[9] = {};
-    lgfx::i2c::transactionWriteRead(0, 0x5D, reg, 2, buf, 9, 400000u);
-    const uint8_t clr[] = { 0x81, 0x4E, 0x00 };
-    lgfx::i2c::transactionWrite(0, 0x5D, clr, 3, 400000u);
-    GT911Touch t;
-    t.count = (buf[0] & 0x80) ? (buf[0] & 0x0F) : 0;
-    t.size  = (t.count > 0) ? ((uint16_t)buf[7] | ((uint16_t)buf[8] << 8)) : 0;
-    return t;
+    unsigned long t0 = millis();
+    while (digitalRead(1) == LOW && millis() - t0 < 2000) {
+        uint8_t status = 0;
+        lgfx::i2c::transactionWriteRead(0, 0x5D, reg, 2, &status, 1, 400000u);
+        lgfx::i2c::transactionWrite(0, 0x5D, clr, 3, 400000u);
+        delay(10);
+    }
 }
 
 static void enterDeepSleep() {
+    // Backlight off
     const uint8_t bl_off = 0x00;
     lgfx::i2c::transactionWrite(0, 0x30, &bl_off, 1, 400000u);
-    // Drain any pending GT911 data while waiting for touch release
-    unsigned long t0 = millis();
-    while (digitalRead(1) == LOW && millis() - t0 < 3000) {
-        gt911ReadAndClear();
-        delay(20);
-    }
-    // Let capacitive charge on the display layer dissipate before we start
-    // watching for touches.  Keep clearing GT911 status so INT stays released.
-    unsigned long dead_end = millis() + 8000UL;
-    while (millis() < dead_end) {
-        gt911ReadAndClear();
-        delay(50);
-    }
-    // Poll for a sustained real touch — two consecutive reads 200 ms apart
-    // both reporting count > 0.  The 8 s dead window above already cleared
-    // the capacitive phantom window, so count alone is sufficient here.
-    for (;;) {
-        delay(200);
-        GT911Touch t = gt911ReadTouch();
-        if (t.count == 0) continue;
-        delay(200);
-        t = gt911ReadTouch();
-        if (t.count == 0) continue;
-        break;
-    }
-    canvas.fillScreen(C_BG);
-    const uint8_t bl_init = 0x10;
-    lgfx::i2c::transactionWrite(0, 0x30, &bl_init, 1, 400000u);
-    delay(50);
-    const uint8_t bl_on = 0x09;
-    lgfx::i2c::transactionWrite(0, 0x30, &bl_on, 1, 400000u);
-    g_screen        = SCREEN_MAIN;
-    g_dirty         = true;
-    g_last_touch_ms = millis();
+
+    // Ensure GT911 INT is released before we arm the wakeup
+    gt911DrainInt();
+    delay(100);
+
+    // GPIO1 = GT911 INT — pulled LOW by the touch controller on any touch event.
+    // ESP32-S3 wakes and runs setup() as a normal boot.
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_1, 0);
+    esp_deep_sleep_start();
+    // Never returns.
 }
 
 static void readBattery();  // defined after drawBatteryIndicator
@@ -986,19 +944,25 @@ static void handleTouch() {
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
     Serial0.begin(115200);
-    delay(2000);
+
+    bool from_sleep = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
+    if (!from_sleep) {
+        delay(2000);
+    }
 
     Wire.begin(15, 16);
     delay(200);
 
-    // I2C bus scan — printed to serial to help diagnose which devices respond
-    Serial0.print("I2C scan:");
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        Wire.beginTransmission(addr);
-        if (Wire.endTransmission() == 0)
-            Serial0.printf(" 0x%02X", addr);
+    if (!from_sleep) {
+        // I2C bus scan — printed to serial to help diagnose which devices respond
+        Serial0.print("I2C scan:");
+        for (uint8_t addr = 1; addr < 127; addr++) {
+            Wire.beginTransmission(addr);
+            if (Wire.endTransmission() == 0)
+                Serial0.printf(" 0x%02X", addr);
+        }
+        Serial0.println();
     }
-    Serial0.println();
 
     // Probe PCF8563 via Wire before lcd.init() — Wire still works at this point.
     Wire.beginTransmission(0x51);
