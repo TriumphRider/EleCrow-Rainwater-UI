@@ -380,33 +380,45 @@ static void sendCmd(const char* path) {
 }
 
 // ── Deep sleep / wake ─────────────────────────────────────────────────────────
-// Clears any pending GT911 touch data so the INT pin returns high before sleep.
-static void gt911DrainInt() {
+// Direct GT911 read — bypasses LGFX rate-limiting.
+// Returns touch point count (0 = no touch / scan pulse, >0 = real touch).
+static int gt911ReadCount() {
     const uint8_t reg[] = { 0x81, 0x4E };
     const uint8_t clr[] = { 0x81, 0x4E, 0x00 };
-    unsigned long t0 = millis();
-    while (digitalRead(1) == LOW && millis() - t0 < 2000) {
-        uint8_t status = 0;
-        lgfx::i2c::transactionWriteRead(0, 0x5D, reg, 2, &status, 1, 400000u);
-        lgfx::i2c::transactionWrite(0, 0x5D, clr, 3, 400000u);
-        delay(10);
-    }
+    uint8_t status = 0;
+    lgfx::i2c::transactionWriteRead(0, 0x5D, reg, 2, &status, 1, 400000u);
+    lgfx::i2c::transactionWrite(0, 0x5D, clr, 3, 400000u);
+    return (status & 0x80) ? (status & 0x0F) : 0;
 }
 
-static void enterDeepSleep() {
-    // Backlight off
+static void enterSleep() {
+    Serial0.println("SLEEP: backlight off");
     const uint8_t bl_off = 0x00;
     lgfx::i2c::transactionWrite(0, 0x30, &bl_off, 1, 400000u);
 
-    // Ensure GT911 INT is released before we arm the wakeup
-    gt911DrainInt();
-    delay(100);
+    // Fixed 1-second drain — clears continuous GT911 scan pulses
+    Serial0.println("SLEEP: draining...");
+    unsigned long drain_end = millis() + 1000;
+    while (millis() < drain_end) {
+        gt911ReadCount();
+        delay(20);
+    }
 
-    // GPIO1 = GT911 INT — pulled LOW by the touch controller on any touch event.
-    // ESP32-S3 wakes and runs setup() as a normal boot.
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_1, 0);
-    esp_deep_sleep_start();
-    // Never returns.
+    // Wait for a real touch (count > 0 means actual finger contact)
+    Serial0.println("SLEEP: waiting for touch...");
+    while (gt911ReadCount() == 0) {
+        delay(20);
+    }
+    Serial0.println("SLEEP: touch detected, waking");
+
+    // Backlight on
+    lgfx::i2c::transactionWrite(0, 0x30, (const uint8_t[]){0x10}, 1, 400000u);
+    delay(50);
+    lgfx::i2c::transactionWrite(0, 0x30, (const uint8_t[]){0x09}, 1, 400000u);
+
+    g_screen        = SCREEN_MAIN;
+    g_dirty         = true;
+    g_last_touch_ms = millis();
 }
 
 static void readBattery();  // defined after drawBatteryIndicator
@@ -868,7 +880,7 @@ static void handleTouch() {
     if (g_screen == SCREEN_MAIN) {
         // SLEEP button (header, top-left)
         if (x >= 8 && x <= 88 && y >= 10 && y <= 40) {
-            enterDeepSleep();
+            enterSleep();
             return;
         }
         // STATS button
@@ -945,24 +957,10 @@ static void handleTouch() {
 void setup() {
     Serial0.begin(115200);
 
-    bool from_sleep = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
-    if (!from_sleep) {
-        delay(2000);
-    }
+    delay(2000);
 
     Wire.begin(15, 16);
     delay(200);
-
-    if (!from_sleep) {
-        // I2C bus scan — printed to serial to help diagnose which devices respond
-        Serial0.print("I2C scan:");
-        for (uint8_t addr = 1; addr < 127; addr++) {
-            Wire.beginTransmission(addr);
-            if (Wire.endTransmission() == 0)
-                Serial0.printf(" 0x%02X", addr);
-        }
-        Serial0.println();
-    }
 
     // Probe PCF8563 via Wire before lcd.init() — Wire still works at this point.
     Wire.beginTransmission(0x51);
@@ -1091,7 +1089,7 @@ void loop() {
 
     // Auto-sleep after idle on main screen
     if (g_screen == SCREEN_MAIN && millis() - g_last_touch_ms > SLEEP_TIMEOUT_MS)
-        enterDeepSleep();
+        enterSleep();
 
     handleTouch();
 
